@@ -1,0 +1,475 @@
+import os
+import json
+import discord
+from discord.ext import commands
+from discord import app_commands
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+STAFF_ROLE_ID = int(os.getenv("STAFF_ROLE_ID", "0"))
+TICKET_CATEGORY_ID = int(os.getenv("TICKET_CATEGORY_ID", "0"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
+
+# Railway persistent volume: mount at /app/data
+DATA_DIR = "/app/data" if os.path.isdir("/app/data") else "."
+os.makedirs(DATA_DIR, exist_ok=True)
+DATA_FILE = os.path.join(DATA_DIR, "tickets.json")
+
+intents = discord.Intents.default()
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+def load_tickets():
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+tickets = load_tickets()
+
+def save_tickets():
+    temp_file = DATA_FILE + ".tmp"
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(tickets, f, indent=4)
+    os.replace(temp_file, DATA_FILE)
+
+def is_staff(member):
+    if not isinstance(member, discord.Member):
+        return False
+    if member.guild_permissions.manage_channels:
+        return True
+    return bool(
+        STAFF_ROLE_ID and
+        discord.utils.get(member.roles, id=STAFF_ROLE_ID)
+    )
+
+async def send_log(guild, message):
+    if not LOG_CHANNEL_ID:
+        return
+    channel = guild.get_channel(LOG_CHANNEL_ID)
+    if channel and isinstance(channel, discord.TextChannel):
+        await channel.send(
+            message,
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+
+def ticket_embed(number, owner):
+    embed = discord.Embed(
+        title=f"?? Ticket #{number}",
+        description=(
+            f"Hello {owner.mention}!\n\n"
+            "Please describe your issue. A staff member will "
+            "assist you shortly.\n\n"
+            "Use the buttons below to manage this ticket."
+        ),
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(text="Support Ticket System")
+    return embed
+
+
+class TicketControls(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Claim",
+        emoji="??",
+        style=discord.ButtonStyle.primary,
+        custom_id="ticket:claim"
+    )
+    async def claim(self, interaction: discord.Interaction,
+                    button: discord.ui.Button):
+
+        if not is_staff(interaction.user):
+            return await interaction.response.send_message(
+                "Only staff can claim tickets.", ephemeral=True
+            )
+
+        ticket = tickets.get(str(interaction.channel_id))
+        if not ticket or ticket["status"] != "open":
+            return await interaction.response.send_message(
+                "This ticket is not open.", ephemeral=True
+            )
+
+        if ticket.get("claimed_by"):
+            return await interaction.response.send_message(
+                f"Already claimed by <@{ticket['claimed_by']}>.",
+                ephemeral=True
+            )
+
+        ticket["claimed_by"] = interaction.user.id
+        save_tickets()
+
+        await interaction.response.send_message(
+            f"?? Ticket claimed by {interaction.user.mention}."
+        )
+        await send_log(
+            interaction.guild,
+            f"?? Ticket #{ticket['number']} claimed by "
+            f"{interaction.user.mention}"
+        )
+
+    @discord.ui.button(
+        label="Close",
+        emoji="??",
+        style=discord.ButtonStyle.danger,
+        custom_id="ticket:close"
+    )
+    async def close(self, interaction: discord.Interaction,
+                    button: discord.ui.Button):
+
+        if not is_staff(interaction.user):
+            return await interaction.response.send_message(
+                "Only staff can close tickets.", ephemeral=True
+            )
+
+        ticket = tickets.get(str(interaction.channel_id))
+        if not ticket or ticket["status"] != "open":
+            return await interaction.response.send_message(
+                "This ticket is not open.", ephemeral=True
+            )
+
+        ticket["status"] = "closed"
+        save_tickets()
+
+        owner = interaction.guild.get_member(ticket["owner"])
+        if owner:
+            await interaction.channel.set_permissions(
+                owner,
+                view_channel=True,
+                send_messages=False,
+                read_message_history=True
+            )
+
+        await interaction.channel.edit(
+            name=f"closed-{ticket['number']}"
+        )
+
+        await interaction.response.send_message(
+            f"?? Ticket closed by {interaction.user.mention}.",
+            view=ClosedControls()
+        )
+        await send_log(
+            interaction.guild,
+            f"?? Ticket #{ticket['number']} closed by "
+            f"{interaction.user.mention}"
+        )
+
+
+class ClosedControls(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Reopen",
+        emoji="??",
+        style=discord.ButtonStyle.success,
+        custom_id="ticket:reopen"
+    )
+    async def reopen(self, interaction: discord.Interaction,
+                     button: discord.ui.Button):
+
+        if not is_staff(interaction.user):
+            return await interaction.response.send_message(
+                "Only staff can reopen tickets.", ephemeral=True
+            )
+
+        ticket = tickets.get(str(interaction.channel_id))
+        if not ticket or ticket["status"] != "closed":
+            return await interaction.response.send_message(
+                "This ticket is not closed.", ephemeral=True
+            )
+
+        owner = interaction.guild.get_member(ticket["owner"])
+        if owner:
+            await interaction.channel.set_permissions(
+                owner,
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True
+            )
+
+        ticket["status"] = "open"
+        save_tickets()
+
+        await interaction.channel.edit(
+            name=f"ticket-{ticket['number']}"
+        )
+        await interaction.response.send_message(
+            f"?? Ticket reopened by {interaction.user.mention}.",
+            view=TicketControls()
+        )
+        await send_log(
+            interaction.guild,
+            f"?? Ticket #{ticket['number']} reopened by "
+            f"{interaction.user.mention}"
+        )
+
+    @discord.ui.button(
+        label="Delete",
+        emoji="???",
+        style=discord.ButtonStyle.danger,
+        custom_id="ticket:delete"
+    )
+    async def delete(self, interaction: discord.Interaction,
+                     button: discord.ui.Button):
+
+        if not is_staff(interaction.user):
+            return await interaction.response.send_message(
+                "Only staff can delete tickets.", ephemeral=True
+            )
+
+        ticket = tickets.get(str(interaction.channel_id))
+        if not ticket:
+            return await interaction.response.send_message(
+                "Ticket not found.", ephemeral=True
+            )
+
+        await interaction.response.send_message(
+            "??? Deleting ticket..."
+        )
+
+        await send_log(
+            interaction.guild,
+            f"??? Ticket #{ticket['number']} deleted by "
+            f"{interaction.user.mention}"
+        )
+
+        tickets.pop(str(interaction.channel_id), None)
+        save_tickets()
+        await interaction.channel.delete(
+            reason="Ticket deleted by staff"
+        )
+
+
+class TicketPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Open a Ticket",
+        emoji="??",
+        style=discord.ButtonStyle.success,
+        custom_id="ticket:open"
+    )
+    async def open_ticket(self, interaction: discord.Interaction,
+                          button: discord.ui.Button):
+
+        guild = interaction.guild
+        user = interaction.user
+
+        existing = next(
+            (
+                t for t in tickets.values()
+                if t["guild"] == guild.id
+                and t["owner"] == user.id
+                and t["status"] == "open"
+            ),
+            None
+        )
+
+        if existing:
+            channel = guild.get_channel(existing["channel"])
+            if channel:
+                return await interaction.response.send_message(
+                    f"You already have a ticket: {channel.mention}",
+                    ephemeral=True
+                )
+
+        number = max(
+            (
+                t["number"] for t in tickets.values()
+                if t["guild"] == guild.id
+            ),
+            default=0
+        ) + 1
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(
+                view_channel=False
+            ),
+            user: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True
+            ),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                manage_channels=True
+            )
+        }
+
+        if STAFF_ROLE_ID:
+            role = guild.get_role(STAFF_ROLE_ID)
+            if role:
+                overwrites[role] = discord.PermissionOverwrite(
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    manage_messages=True
+                )
+
+        category = (
+            guild.get_channel(TICKET_CATEGORY_ID)
+            if TICKET_CATEGORY_ID else None
+        )
+
+        channel = await guild.create_text_channel(
+            name=f"ticket-{number}",
+            category=(
+                category
+                if isinstance(category, discord.CategoryChannel)
+                else None
+            ),
+            overwrites=overwrites,
+            topic=f"Ticket #{number} | Owner: {user.id}"
+        )
+
+        tickets[str(channel.id)] = {
+            "number": number,
+            "guild": guild.id,
+            "channel": channel.id,
+            "owner": user.id,
+            "status": "open",
+            "claimed_by": None
+        }
+        save_tickets()
+
+        await channel.send(
+            content=(
+                f"{user.mention}"
+                + (f" <@&{STAFF_ROLE_ID}>" if STAFF_ROLE_ID else "")
+            ),
+            embed=ticket_embed(number, user),
+            view=TicketControls(),
+            allowed_mentions=discord.AllowedMentions(
+                users=True,
+                roles=bool(STAFF_ROLE_ID)
+            )
+        )
+
+        await interaction.response.send_message(
+            f"? Your ticket has been created: {channel.mention}",
+            ephemeral=True
+        )
+
+        await send_log(
+            guild,
+            f"?? Ticket #{number} opened by {user.mention}: "
+            f"{channel.mention}"
+        )
+
+
+@bot.event
+async def on_ready():
+    bot.add_view(TicketPanel())
+    bot.add_view(TicketControls())
+    bot.add_view(ClosedControls())
+
+    if not getattr(bot, "synced", False):
+        synced = await bot.tree.sync()
+        bot.synced = True
+        print(f"Synced {len(synced)} slash commands.")
+
+    print(f"Logged in as {bot.user}")
+
+
+@bot.tree.command(
+    name="panel",
+    description="Create the ticket panel"
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def panel(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="?? Support Center",
+        description=(
+            "Need help? Click the button below to open a private ticket.\n"
+            "Our support team will assist you as soon as possible."
+        ),
+        color=discord.Color.blurple()
+    )
+    embed.set_footer(text="Support Ticket System")
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=TicketPanel()
+    )
+
+
+@bot.tree.command(
+    name="tickets",
+    description="List recent tickets"
+)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def list_tickets(interaction: discord.Interaction):
+    guild_tickets = [
+        t for t in tickets.values()
+        if t["guild"] == interaction.guild_id
+    ]
+    guild_tickets.sort(
+        key=lambda t: t["number"], reverse=True
+    )
+    guild_tickets = guild_tickets[:20]
+
+    if not guild_tickets:
+        return await interaction.response.send_message(
+            "No tickets found.", ephemeral=True
+        )
+
+    lines = []
+    for t in guild_tickets:
+        channel = interaction.guild.get_channel(t["channel"])
+        channel_text = (
+            channel.mention if channel else "Deleted channel"
+        )
+        claimed = (
+            f" | Claimed by <@{t['claimed_by']}>"
+            if t.get("claimed_by") else ""
+        )
+        lines.append(
+            f"**#{t['number']}** {channel_text} — "
+            f"{t['status']}{claimed}"
+        )
+
+    embed = discord.Embed(
+        title="?? Recent Tickets",
+        description="\n".join(lines),
+        color=discord.Color.blurple()
+    )
+    await interaction.response.send_message(
+        embed=embed, ephemeral=True
+    )
+
+
+@bot.tree.error
+async def on_app_command_error(interaction, error):
+    if isinstance(error, app_commands.MissingPermissions):
+        message = (
+            "You need the Manage Server permission "
+            "to use this command."
+        )
+    else:
+        print(f"Command error: {error}")
+        message = "An error occurred while running that command."
+
+    if interaction.response.is_done():
+        await interaction.followup.send(
+            message, ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            message, ephemeral=True
+        )
+
+
+if not TOKEN:
+    raise RuntimeError("Set DISCORD_TOKEN in Railway Variables.")
+
+bot.run(TOKEN)
